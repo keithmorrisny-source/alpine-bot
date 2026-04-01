@@ -15,7 +15,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Chromium for Playwright
-RUN apt-get update && apt-get install -y fonts-unifont && rm -rf /var/lib/apt/lists/* && playwright install --with-deps chromium
+RUN playwright install chromium
 
 COPY . .
 
