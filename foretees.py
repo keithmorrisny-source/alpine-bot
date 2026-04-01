@@ -33,7 +33,10 @@ class ForeTees:
 
     async def start(self):
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=True)
+        self._browser = await self._playwright.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
         storage = SESSION_FILE if os.path.exists(SESSION_FILE) else None
         self._context = await self._browser.new_context(
             storage_state=storage,
