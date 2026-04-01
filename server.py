@@ -24,8 +24,9 @@ async def lifespan(app: FastAPI):
     """Start and stop the Playwright browser with the app."""
     global _ft
     _ft = ForeTees(config.FORETEES_USERNAME, config.FORETEES_PASSWORD)
-    await _ft.start()
-    print("✅ ForeTees browser started.")
+    # Start browser in background so server can respond to healthchecks immediately
+    asyncio.create_task(_ft.start())
+    print("🚀 ForeTees browser starting in background...")
     yield
     await _ft.stop()
     print("🛑 ForeTees browser stopped.")
