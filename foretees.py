@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional
 from playwright.async_api import async_playwright, Page, BrowserContext
 
 # ── Club-specific ForeTees URLs ──────────────────────────────────────────────────────────────
+LOGIN_URL   = "https://ccapp.foretees.com/v5/servlet/LoginPrompt?cn=alpinecc"
 GOLF_BASE   = "https://ccapp.foretees.com/v5/alpinecc_golf_m24"
 TENNIS_BASE = "https://ccapp.foretees.com/v5/alpinecc_flxrez12_m24"
 DINING_BASE = "https://ccapp.foretees.com/v5/alpinecc_dining_m24"
@@ -58,30 +59,58 @@ class ForeTees:
     async def _new_page(self) -> Page:
         return await self._context.new_page()
 
+    async def _is_error_page(self, page: Page) -> bool:
+        """Return True if the current page shows a login error or access-denied message."""
+        body = (await page.text_content("body") or "").lower()
+        return any(
+            phrase in body
+            for phrase in ["invalid", "incorrect", "error", "denied", "failed to login", "login failed"]
+        )
+
     async def _ensure_logged_in(self, page: Page, base_url: str) -> bool:
-        """Navigate to the section and log in if needed. Returns True on success."""
+        """
+        Navigate to the section and log in if needed. Returns True on success.
+
+        Strategy:
+        1. Try to navigate directly to the section's member page.
+        2. If we land on a login form, authenticate via the dedicated LOGIN_URL
+           using the exact form field names ForeTees expects.
+        3. Save the session cookie state on success so subsequent pages skip login.
+        """
+        print(f"[ForeTees] Navigating to {base_url}/Member_select")
         await page.goto(f"{base_url}/Member_select", wait_until="networkidle", timeout=30000)
 
+        # Already authenticated — session cookie is still valid
         if await page.locator("text=Welcome").count() > 0:
+            print("[ForeTees] Session still valid, skipping login.")
             return True
 
+        # Not authenticated — go to the dedicated login page
+        print(f"[ForeTees] Session expired or missing, logging in via {LOGIN_URL}")
         try:
-            await page.wait_for_selector('input[type="password"]', timeout=8000)
+            await page.goto(LOGIN_URL, wait_until="networkidle", timeout=30000)
 
-            uid_sel = 'input[name="member_id"], input[name="username"], input[name="user_id"], input[type="text"]:first-of-type'
-            await page.locator(uid_sel).first.fill(self.username)
-            await page.locator('input[type="password"]').fill(self.password)
+            # Wait for the username field by its exact name attribute
+            await page.wait_for_selector("input[name='user_name']", timeout=10000)
 
-            await page.locator(
-                'input[type="submit"], button[type="submit"], '
-                'button:has-text("Login"), button:has-text("Sign In"), '
-                'input[value="Login"]'
-            ).first.click()
+            await page.locator("input[name='user_name']").fill(self.username)
+            await page.locator("input[name='password']").fill(self.password)
+
+            # Click the Sign In submit button
+            await page.locator("input[value='Sign In']").click()
             await page.wait_for_load_state("networkidle", timeout=20000)
 
-            await self._context.storage_state(path=SESSION_FILE)
+            if await self._is_error_page(page):
+                print("[ForeTees] Login failed — error page detected after submit.")
+                return False
 
-            return await page.locator("text=Welcome").count() > 0
+            # Persist the authenticated session for future pages
+            await self._save_session()
+            print("[ForeTees] Login successful, session saved.")
+
+            # Now navigate to the originally requested section
+            await page.goto(f"{base_url}/Member_select", wait_until="networkidle", timeout=30000)
+            return True
 
         except Exception as exc:
             print(f"[ForeTees] Login error: {exc}")
@@ -102,12 +131,14 @@ class ForeTees:
         """
         page = await self._new_page()
         try:
-            await self._ensure_logged_in(page, GOLF_BASE)
-            await page.goto(
-                f"{GOLF_BASE}/Member_sheet?calDate={date_str}&course=&displayOpt=0",
-                wait_until="networkidle",
-                timeout=30000,
-            )
+            logged_in = await self._ensure_logged_in(page, GOLF_BASE)
+            if not logged_in:
+                print("[ForeTees] get_tee_times: authentication failed.")
+                return []
+
+            url = f"{GOLF_BASE}/Member_sheet?calDate={date_str}&course=&displayOpt=0"
+            print(f"[ForeTees] get_tee_times: fetching {url}")
+            await page.goto(url, wait_until="networkidle", timeout=30000)
 
             time_links = await page.locator('a[href="#"]').all()
             available: List[Dict[str, Any]] = []
@@ -132,8 +163,12 @@ class ForeTees:
 
                 available.append({"time": text, "fb": fb, "open_spots": open_spots})
 
+            print(f"[ForeTees] get_tee_times: found {len(available)} slots for {date_str}.")
             return available
 
+        except Exception as exc:
+            print(f"[ForeTees] get_tee_times error: {exc}")
+            return []
         finally:
             await page.close()
 
@@ -144,7 +179,12 @@ class ForeTees:
         """
         page = await self._new_page()
         try:
-            await self._ensure_logged_in(page, GOLF_BASE)
+            logged_in = await self._ensure_logged_in(page, GOLF_BASE)
+            if not logged_in:
+                print("[ForeTees] book_tee_time: authentication failed.")
+                return {"success": False, "message": "⚠️ Could not log in to ForeTees. Please try again."}
+
+            print(f"[ForeTees] book_tee_time: booking {time_str} on {date_str}")
             await page.goto(
                 f"{GOLF_BASE}/Member_sheet?calDate={date_str}&course=&displayOpt=0",
                 wait_until="networkidle",
@@ -190,8 +230,12 @@ class ForeTees:
         """
         page = await self._new_page()
         try:
-            await self._ensure_logged_in(page, TENNIS_BASE)
+            logged_in = await self._ensure_logged_in(page, TENNIS_BASE)
+            if not logged_in:
+                print("[ForeTees] get_tennis_courts: authentication failed.")
+                return []
 
+            print(f"[ForeTees] get_tennis_courts: fetching courts for {date_str}")
             await page.goto(f"{TENNIS_BASE}/Member_gensheets", wait_until="networkidle", timeout=30000)
 
             date_input = page.locator('input[type="text"]').first
@@ -221,8 +265,12 @@ class ForeTees:
                             "href": href,
                         })
 
+            print(f"[ForeTees] get_tennis_courts: found {len(available)} slots for {date_str}.")
             return available
 
+        except Exception as exc:
+            print(f"[ForeTees] get_tennis_courts error: {exc}")
+            return []
         finally:
             await page.close()
 
@@ -236,7 +284,12 @@ class ForeTees:
         """Book a tennis court slot."""
         page = await self._new_page()
         try:
-            await self._ensure_logged_in(page, TENNIS_BASE)
+            logged_in = await self._ensure_logged_in(page, TENNIS_BASE)
+            if not logged_in:
+                print("[ForeTees] book_tennis_court: authentication failed.")
+                return {"success": False, "message": "⚠️ Could not log in to ForeTees. Please try again."}
+
+            print(f"[ForeTees] book_tennis_court: booking court {court_num} at {time_str} on {date_str}")
             await page.goto(f"{TENNIS_BASE}/Member_gensheets", wait_until="networkidle", timeout=30000)
 
             date_input = page.locator('input[type="text"]').first
@@ -304,7 +357,12 @@ class ForeTees:
         """
         page = await self._new_page()
         try:
-            await self._ensure_logged_in(page, DINING_BASE)
+            logged_in = await self._ensure_logged_in(page, DINING_BASE)
+            if not logged_in:
+                print("[ForeTees] get_dining_slots: authentication failed.")
+                return []
+
+            print(f"[ForeTees] get_dining_slots: fetching dining slots for {date_str}")
             await page.goto(f"{DINING_BASE}/Dining_slot_v2?action=new", wait_until="networkidle", timeout=30000)
 
             date_input = page.locator('input[type="text"]').first
@@ -339,8 +397,12 @@ class ForeTees:
                         if t:
                             available.append({"location": label_text or "Dining Room", "time": t})
 
+            print(f"[ForeTees] get_dining_slots: found {len(available)} slots for {date_str}.")
             return available
 
+        except Exception as exc:
+            print(f"[ForeTees] get_dining_slots error: {exc}")
+            return []
         finally:
             await page.close()
 
@@ -354,7 +416,12 @@ class ForeTees:
         """Book a dining reservation."""
         page = await self._new_page()
         try:
-            await self._ensure_logged_in(page, DINING_BASE)
+            logged_in = await self._ensure_logged_in(page, DINING_BASE)
+            if not logged_in:
+                print("[ForeTees] book_dining: authentication failed.")
+                return {"success": False, "message": "⚠️ Could not log in to ForeTees. Please try again."}
+
+            print(f"[ForeTees] book_dining: booking {time_str} for {party_size} on {date_str}")
             await page.goto(f"{DINING_BASE}/Dining_slot_v2?action=new", wait_until="networkidle", timeout=30000)
 
             date_input = page.locator('input[type="text"]').first
